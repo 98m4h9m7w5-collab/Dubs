@@ -1,218 +1,288 @@
 --[[
-    NPC Void on Network Ownership  v2.0
+    NPC Void v3.0 — Boss Edition
     ─────────────────────────────────────────────────────────────────────────────
-    How it works:
-      Roblox auto-grants network ownership of unanchored BaseParts to the
-      closest player within ~50 studs.  Once the client owns the physics,
-      CFrame / Velocity mutations replicate to the server.
-      Setting Y < -2000 triggers Roblox's server-side void kill, bypassing
-      the NPC's HP completely.
+    Adds 3 extra kill methods specifically for server-locked NPCs (bosses):
 
-    Void pipeline:
-      1. Unanchor every BasePart in the NPC model
-      2. Destroy any BodyMovers fighting our force
-      3. Apply BodyVelocity (0, -9999, 0) on HumanoidRootPart
-      4. After 80 ms, teleport root to Y -2500 as a fallback
+    Method A · Rapid CFrame Spam
+      Overrides the position every Heartbeat tick faster than the server
+      can correct it. Works when the server correction delay is > 1 frame.
 
-    ─────────────────────────────────────────────────────────────────────────────
-    BACKTEST RESULTS  (traced before ship — see bottom of file)
-    All 9 scenarios pass. Details at end of file.
+    Method B · AlignPosition (bypasses BodyVelocity blocks)
+      Some games block BodyVelocity but not constraint-based movers.
+      AlignPosition with max force can override server corrections.
+
+    Method C · RemoteEvent Scan (damage fishing)
+      Scans the game for RemoteEvents with damage-related names and
+      fires them with the boss + huge damage value.
+      Works when the game processes damage client→server via remotes.
     ─────────────────────────────────────────────────────────────────────────────
 --]]
 
--- ═══════════════════════════════════════════════════════════════════════════════
--- 0 · Services
--- ═══════════════════════════════════════════════════════════════════════════════
-local Players       = game:GetService("Players")
-local RunService    = game:GetService("RunService")
-local TweenService  = game:GetService("TweenService")
+local Players      = game:GetService("Players")
+local RunService   = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
 
 local player = Players.LocalPlayer
 
 -- ═══════════════════════════════════════════════════════════════════════════════
--- 1 · Config  (mutated by GUI)
+-- 1 · Config
 -- ═══════════════════════════════════════════════════════════════════════════════
 local cfg = {
-    enabled     = false,
-    killAll     = false,   -- skip range / ownership check
-    range       = 50,      -- studs  (Roblox default auto-ownership radius)
-    nameFilter  = "",      -- "" = match everything
-    debugLog    = false,
+    enabled      = false,
+    killAll      = false,
+    range        = 50,
+    nameFilter   = "",
+    debugLog     = false,
+
+    -- Method toggles
+    useBodyVel   = true,   -- Method 1: BodyVelocity (works on auto-owned NPCs)
+    useSpam      = true,   -- Method 2: Rapid CFrame spam (server-locked NPCs)
+    useAlign     = true,   -- Method 3: AlignPosition constraint
+    useRemotes   = true,   -- Method 4: RemoteEvent damage scan
 }
 
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- 2 · State
 -- ═══════════════════════════════════════════════════════════════════════════════
-local processed  = {}   -- [Model] = true  — already-voided this session
-local liveNPCs   = {}   -- [Model] = true  — current NPC set (updated live)
-local voidCount  = 0
-local statusLabel  -- assigned after GUI is built
+local processed   = {}
+local liveNPCs    = {}
+local spamTargets = {}   -- NPCs being CFrame-spammed this frame
+local voidCount   = 0
+local statusLabel
 
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- 3 · Utilities
 -- ═══════════════════════════════════════════════════════════════════════════════
+local VOID = CFrame.new(0, -2500, 0)
+
 local function log(msg)
-    if cfg.debugLog then
-        print(("[NVoid] %s"):format(msg))
-    end
+    if cfg.debugLog then print("[NVoid3] " .. msg) end
 end
 
 local function getMyRoot()
-    local char = player.Character
-    if not char then return nil end
-    return char:FindFirstChild("HumanoidRootPart")
+    local c = player.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
 end
 
--- An object is an NPC if it is a Model, is NOT a player character,
--- has a living Humanoid, and has at least one BasePart.
 local function isNPC(model)
     if not model:IsA("Model") then return false end
-    if Players:GetPlayerFromCharacter(model) then return false end   -- skip real players
+    if Players:GetPlayerFromCharacter(model) then return false end
     local hum = model:FindFirstChildOfClass("Humanoid")
     if not hum or hum.Health <= 0 then return false end
-    -- Must have at least one BasePart to own
     return model:FindFirstChildWhichIsA("BasePart", true) ~= nil
 end
 
--- Returns the best "root" part to attach our BodyVelocity to.
--- Priority: HumanoidRootPart > PrimaryPart > first BasePart
 local function getRootPart(npc)
     return npc:FindFirstChild("HumanoidRootPart")
         or npc.PrimaryPart
         or npc:FindFirstChildWhichIsA("BasePart", true)
 end
 
--- Returns true when WE are the closest player to rootPart within cfg.range,
--- meaning Roblox has (or will immediately grant) us network ownership.
 local function hasOwnership(rootPart)
     if cfg.killAll then return true end
-
     local myRoot = getMyRoot()
     if not myRoot then return false end
-
     local myDist = (rootPart.Position - myRoot.Position).Magnitude
     if myDist > cfg.range then return false end
-
-    -- Ensure no other player is closer (they'd own it instead)
     for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= player then
-            local char = p.Character
-            if char then
-                local theirRoot = char:FindFirstChild("HumanoidRootPart")
-                if theirRoot then
-                    if (rootPart.Position - theirRoot.Position).Magnitude < myDist then
-                        log(("Ownership lost for NPC near %s — %s is closer"):format(
-                            rootPart.Parent.Name, p.Name))
-                        return false
-                    end
-                end
+        if p ~= player and p.Character then
+            local r = p.Character:FindFirstChild("HumanoidRootPart")
+            if r and (rootPart.Position - r.Position).Magnitude < myDist then
+                return false
             end
         end
     end
-
     return true
 end
 
--- Name filter: blank matches everything; otherwise substring match (case-insensitive)
 local function passesFilter(npc)
     if cfg.nameFilter == "" then return true end
     return npc.Name:lower():find(cfg.nameFilter:lower(), 1, true) ~= nil
 end
 
 -- ═══════════════════════════════════════════════════════════════════════════════
--- 4 · NPC Live Tracker
---     Maintains liveNPCs so the heartbeat iterates a small set
---     instead of scanning all of workspace every frame.
+-- 4 · NPC Tracker
 -- ═══════════════════════════════════════════════════════════════════════════════
-local function onDescendantAdded(obj)
+local function onAdded(obj)
     if isNPC(obj) then
         liveNPCs[obj] = true
-        log(("Tracking new NPC: %s  (HP: %g)"):format(
-            obj.Name,
-            (obj:FindFirstChildOfClass("Humanoid") or {}).Health or -1))
+        log("Tracking: " .. obj.Name)
     end
 end
 
-local function onDescendantRemoving(obj)
+local function onRemoving(obj)
     if liveNPCs[obj] then
         liveNPCs[obj]    = nil
-        processed[obj]   = nil   -- allow re-void if NPC respawns as new instance
-        log(("Stopped tracking NPC: %s"):format(obj.Name))
+        processed[obj]   = nil
+        spamTargets[obj] = nil
     end
 end
 
--- Initial population
-for _, obj in ipairs(workspace:GetDescendants()) do
-    onDescendantAdded(obj)
-end
+for _, v in ipairs(workspace:GetDescendants()) do onAdded(v) end
+workspace.DescendantAdded:Connect(onAdded)
+workspace.DescendantRemoving:Connect(onRemoving)
 
-workspace.DescendantAdded:Connect(onDescendantAdded)
-workspace.DescendantRemoving:Connect(onDescendantRemoving)
-
--- Also re-check Humanoid health changes (NPC can die without being removed)
 workspace.DescendantAdded:Connect(function(obj)
     if obj:IsA("Humanoid") then
         obj:GetPropertyChangedSignal("Health"):Connect(function()
-            local model = obj.Parent
-            if model and obj.Health <= 0 then
-                liveNPCs[model] = nil
+            if obj.Health <= 0 and obj.Parent then
+                liveNPCs[obj.Parent]    = nil
+                spamTargets[obj.Parent] = nil
             end
         end)
     end
 end)
 
 -- ═══════════════════════════════════════════════════════════════════════════════
--- 5 · Void Logic
+-- 5 · Kill Methods
 -- ═══════════════════════════════════════════════════════════════════════════════
-local function voidNPC(npc)
+
+-- METHOD 1: BodyVelocity — best for auto-owned NPCs
+local function methodBodyVel(npc)
     local root = getRootPart(npc)
-    if not root then
-        log(("No root part found for %s — skip"):format(npc.Name))
-        return false
+    if not root then return end
+
+    for _, p in ipairs(npc:GetDescendants()) do
+        if p:IsA("BasePart") then p.Anchored = false end
     end
 
-    local hum = npc:FindFirstChildOfClass("Humanoid")
-    log(("Voiding '%s'  HP=%g  root=%s"):format(
-        npc.Name, hum and hum.Health or -1, root.Name))
-
-    -- Step 1: Unanchor every BasePart so they fall with the root
-    for _, part in ipairs(npc:GetDescendants()) do
-        if part:IsA("BasePart") then
-            part.Anchored = false
-        end
-    end
-
-    -- Step 2: Remove any BodyMovers that would resist our velocity
     for _, inst in ipairs(root:GetChildren()) do
-        if inst:IsA("BodyMover") then
-            inst:Destroy()
-        end
+        if inst:IsA("BodyMover") then inst:Destroy() end
     end
 
-    -- Step 3: Apply a massive downward BodyVelocity
-    --         Only Y force so we don't throw it sideways unpredictably
-    local bv        = Instance.new("BodyVelocity")
-    bv.Name         = "_VoidLauncher"
-    bv.Velocity     = Vector3.new(0, -9999, 0)
-    bv.MaxForce     = Vector3.new(0, 1e9, 0)   -- avoid math.huge (executor quirks)
-    bv.P            = 1e9
-    bv.Parent       = root
+    local bv = Instance.new("BodyVelocity")
+    bv.Name     = tostring(math.random(1e5, 9e5))
+    bv.Velocity = Vector3.new(0, -9999, 0)
+    bv.MaxForce = Vector3.new(0, 1e9, 0)
+    bv.P        = 1e9
+    bv.Parent   = root
 
-    -- Step 4: Teleport fallback after 80 ms in case BodyVelocity is blocked
     task.delay(0.08, function()
-        if root and root.Parent and root.Parent.Parent then
-            root.CFrame = CFrame.new(0, -2500, 0)
-            log(("Fallback teleport fired for '%s'"):format(npc.Name))
+        if root and root.Parent then
+            root.CFrame = VOID
         end
     end)
 
-    return true
+    log("Method 1 (BodyVel) applied to " .. npc.Name)
+end
+
+-- METHOD 2: Rapid CFrame spam — overwhelms server correction on locked NPCs
+-- Sets EVERY BasePart to void position every single Heartbeat tick.
+-- The server corrects slower than we spam on high-ping or busy servers.
+local function methodSpam(npc)
+    spamTargets[npc] = true
+    log("Method 2 (CFrame spam) started on " .. npc.Name)
+
+    -- Auto-stop after 5 seconds (NPC should be dead by then)
+    task.delay(5, function()
+        spamTargets[npc] = nil
+        log("CFrame spam stopped for " .. npc.Name)
+    end)
+end
+
+-- METHOD 3: AlignPosition — constraint-based mover, bypasses BodyVelocity blocks
+local function methodAlign(npc)
+    local root = getRootPart(npc)
+    if not root then return end
+
+    for _, p in ipairs(npc:GetDescendants()) do
+        if p:IsA("BasePart") then p.Anchored = false end
+    end
+
+    -- AlignPosition needs an attachment
+    local att0 = Instance.new("Attachment")
+    att0.Name   = tostring(math.random(1e5, 9e5))
+    att0.Parent = root
+
+    local att1 = Instance.new("Attachment")
+    att1.Name     = tostring(math.random(1e5, 9e5))
+    att1.Position = Vector3.new(0, -2500, 0)
+    att1.Parent   = workspace.Terrain
+
+    local align = Instance.new("AlignPosition")
+    align.Name           = tostring(math.random(1e5, 9e5))
+    align.Attachment0    = att0
+    align.Attachment1    = att1
+    align.MaxForce       = 1e9
+    align.MaxVelocity    = 9999
+    align.Responsiveness = 200
+    align.RigidityEnabled = true   -- bypasses mass / force limits
+    align.Parent         = root
+
+    -- Cleanup after 3 seconds
+    task.delay(3, function()
+        pcall(function() att0:Destroy() end)
+        pcall(function() att1:Destroy() end)
+        pcall(function() align:Destroy() end)
+    end)
+
+    log("Method 3 (AlignPosition) applied to " .. npc.Name)
+end
+
+-- METHOD 4: RemoteEvent damage scan — fires game damage remotes directly
+-- Works for games where damage goes through client→server remotes (common pattern)
+local DAMAGE_KEYS = {
+    "damage", "takedamage", "hurt", "hit", "kill",
+    "attack", "dealdamage", "inflict", "reducehp",
+    "bossdamage", "npcdamage", "enemydamage"
+}
+
+local function methodRemotes(npc)
+    local hum = npc:FindFirstChildOfClass("Humanoid")
+    local dmg = hum and (hum.MaxHealth + 99999) or 99999
+
+    -- Direct health attempt (works in unprotected games)
+    pcall(function()
+        if hum then
+            hum.Health = 0
+            hum:TakeDamage(dmg)
+        end
+    end)
+
+    -- Scan all RemoteEvents/Functions for damage keywords
+    for _, remote in ipairs(game:GetDescendants()) do
+        if remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction") then
+            local name = remote.Name:lower():gsub("%s+", ""):gsub("_", "")
+            for _, key in ipairs(DAMAGE_KEYS) do
+                if name:find(key, 1, true) then
+                    pcall(function()
+                        -- Try common argument patterns games use
+                        if remote:IsA("RemoteEvent") then
+                            remote:FireServer(npc, dmg)
+                            remote:FireServer(npc, hum, dmg)
+                            remote:FireServer(dmg, npc)
+                        else
+                            remote:InvokeServer(npc, dmg)
+                        end
+                    end)
+                    log("Fired remote: " .. remote.Name .. " on " .. npc.Name)
+                    break
+                end
+            end
+        end
+    end
+
+    log("Method 4 (Remotes) applied to " .. npc.Name)
 end
 
 -- ═══════════════════════════════════════════════════════════════════════════════
--- 6 · Heartbeat Scanner
+-- 6 · CFrame spam loop (Heartbeat)
 -- ═══════════════════════════════════════════════════════════════════════════════
 RunService.Heartbeat:Connect(function()
+    -- CFrame spam for server-locked bosses
+    for npc in pairs(spamTargets) do
+        if liveNPCs[npc] then
+            for _, part in ipairs(npc:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    pcall(function() part.CFrame = VOID end)
+                end
+            end
+        else
+            spamTargets[npc] = nil
+        end
+    end
+
+    -- Main void scan
     if not cfg.enabled then return end
 
     for npc in pairs(liveNPCs) do
@@ -220,13 +290,15 @@ RunService.Heartbeat:Connect(function()
             local root = getRootPart(npc)
             if root and hasOwnership(root) then
                 processed[npc] = true
-                local ok = voidNPC(npc)
-                if ok then
-                    voidCount = voidCount + 1
-                    if statusLabel then
-                        statusLabel.Text = ("● %d NPC%s voided"):format(
-                            voidCount, voidCount == 1 and "" or "s")
-                    end
+
+                if cfg.useBodyVel   then methodBodyVel(npc) end
+                if cfg.useSpam      then methodSpam(npc)    end
+                if cfg.useAlign     then methodAlign(npc)   end
+                if cfg.useRemotes   then methodRemotes(npc) end
+
+                voidCount = voidCount + 1
+                if statusLabel then
+                    statusLabel.Text = ("● %d voided"):format(voidCount)
                 end
             end
         end
@@ -236,120 +308,106 @@ end)
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- 7 · GUI
 -- ═══════════════════════════════════════════════════════════════════════════════
-
--- ── Palette ──────────────────────────────────────────────────────────────────
 local C = {
-    bg       = Color3.fromRGB(12, 12, 17),
-    surface  = Color3.fromRGB(22, 22, 32),
-    card     = Color3.fromRGB(28, 28, 42),
-    border   = Color3.fromRGB(55, 55, 85),
-    accent   = Color3.fromRGB(108, 92, 231),
-    accentHi = Color3.fromRGB(140, 122, 255),
-    danger   = Color3.fromRGB(220, 60, 60),
-    txt      = Color3.fromRGB(225, 222, 240),
-    txtDim   = Color3.fromRGB(130, 126, 155),
-    on       = Color3.fromRGB(92, 214, 140),
-    off      = Color3.fromRGB(60, 58, 80),
-    knob     = Color3.fromRGB(240, 238, 255),
+    bg      = Color3.fromRGB(11, 11, 16),
+    surface = Color3.fromRGB(20, 20, 30),
+    card    = Color3.fromRGB(26, 26, 40),
+    border  = Color3.fromRGB(50, 50, 78),
+    accent  = Color3.fromRGB(108, 92, 231),
+    accentH = Color3.fromRGB(140, 122, 255),
+    txt     = Color3.fromRGB(225, 222, 240),
+    txtD    = Color3.fromRGB(120, 116, 148),
+    on      = Color3.fromRGB(92, 214, 140),
+    off     = Color3.fromRGB(55, 52, 75),
+    knob    = Color3.fromRGB(240, 238, 255),
+    danger  = Color3.fromRGB(220, 60, 60),
 }
 
--- ── Root ScreenGui ────────────────────────────────────────────────────────────
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name           = "NPCVoidGUI"
-screenGui.ResetOnSpawn   = false
-screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-screenGui.IgnoreGuiInset = true
-screenGui.Parent         = player.PlayerGui
+local sg = Instance.new("ScreenGui")
+sg.Name = tostring(math.random(1e6, 9e6))
+sg.ResetOnSpawn = false
+sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+sg.IgnoreGuiInset = true
+sg.Parent = player.PlayerGui
 
--- ── Main window ───────────────────────────────────────────────────────────────
-local win = Instance.new("Frame")
-win.Name             = "Window"
-win.Size             = UDim2.new(0, 265, 0, 370)
-win.Position         = UDim2.new(0, 24, 0.5, -185)
+local win = Instance.new("Frame", sg)
+win.Size = UDim2.new(0, 270, 0, 520)
+win.Position = UDim2.new(0, 24, 0.5, -260)
 win.BackgroundColor3 = C.bg
-win.BorderSizePixel  = 0
-win.Active           = true
-win.Draggable        = true
+win.BorderSizePixel = 0
+win.Active = true
+win.Draggable = true
 win.ClipsDescendants = true
-win.Parent           = screenGui
-Instance.new("UICorner",  win).CornerRadius = UDim.new(0, 12)
-local winStroke = Instance.new("UIStroke", win)
-winStroke.Color = C.border; winStroke.Thickness = 1
+Instance.new("UICorner", win).CornerRadius = UDim.new(0, 12)
+local ws = Instance.new("UIStroke", win)
+ws.Color = C.border; ws.Thickness = 1
 
--- ── Title bar ─────────────────────────────────────────────────────────────────
-local titleBar = Instance.new("Frame", win)
-titleBar.Size            = UDim2.new(1, 0, 0, 40)
-titleBar.BackgroundColor3 = C.surface
-titleBar.BorderSizePixel = 0
-Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 12)
--- patch lower corners
-local tbPatch = Instance.new("Frame", titleBar)
-tbPatch.Size = UDim2.new(1, 0, 0, 12); tbPatch.Position = UDim2.new(0, 0, 1, -12)
-tbPatch.BackgroundColor3 = C.surface; tbPatch.BorderSizePixel = 0
+-- Title bar
+local tb = Instance.new("Frame", win)
+tb.Size = UDim2.new(1, 0, 0, 40)
+tb.BackgroundColor3 = C.surface
+tb.BorderSizePixel = 0
+Instance.new("UICorner", tb).CornerRadius = UDim.new(0, 12)
+local tbp = Instance.new("Frame", tb)
+tbp.Size = UDim2.new(1, 0, 0, 12)
+tbp.Position = UDim2.new(0, 0, 1, -12)
+tbp.BackgroundColor3 = C.surface
+tbp.BorderSizePixel = 0
 
-local titleIcon = Instance.new("TextLabel", titleBar)
-titleIcon.Size = UDim2.new(0, 30, 1, 0); titleIcon.Position = UDim2.new(0, 10, 0, 0)
-titleIcon.BackgroundTransparency = 1
-titleIcon.Text = "⚡"; titleIcon.TextSize = 16
-titleIcon.Font = Enum.Font.GothamBold
-titleIcon.TextColor3 = C.accentHi
+local ti = Instance.new("TextLabel", tb)
+ti.Size = UDim2.new(0, 30, 1, 0); ti.Position = UDim2.new(0, 10, 0, 0)
+ti.BackgroundTransparency = 1; ti.Text = "⚡"
+ti.TextSize = 16; ti.Font = Enum.Font.GothamBold; ti.TextColor3 = C.accentH
 
-local titleTxt = Instance.new("TextLabel", titleBar)
-titleTxt.Size = UDim2.new(1, -80, 1, 0); titleTxt.Position = UDim2.new(0, 36, 0, 0)
-titleTxt.BackgroundTransparency = 1
-titleTxt.Text = "NPC Void"; titleTxt.TextSize = 14
-titleTxt.Font = Enum.Font.GothamBold; titleTxt.TextColor3 = C.txt
-titleTxt.TextXAlignment = Enum.TextXAlignment.Left
+local tt = Instance.new("TextLabel", tb)
+tt.Size = UDim2.new(1, -80, 1, 0); tt.Position = UDim2.new(0, 36, 0, 0)
+tt.BackgroundTransparency = 1; tt.Text = "NPC Void  ·  Boss Edition"
+tt.TextSize = 13; tt.Font = Enum.Font.GothamBold
+tt.TextColor3 = C.txt; tt.TextXAlignment = Enum.TextXAlignment.Left
 
--- Minimize button
-local minBtn = Instance.new("TextButton", titleBar)
-minBtn.Size = UDim2.new(0, 28, 0, 28); minBtn.Position = UDim2.new(1, -36, 0.5, -14)
-minBtn.BackgroundColor3 = C.card; minBtn.Text = "−"
-minBtn.TextColor3 = C.txtDim; minBtn.TextSize = 18
-minBtn.Font = Enum.Font.GothamBold; minBtn.BorderSizePixel = 0
-Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 7)
-
-local minimized = false
-minBtn.MouseButton1Click:Connect(function()
-    minimized = not minimized
-    win.Size  = minimized and UDim2.new(0, 265, 0, 40) or UDim2.new(0, 265, 0, 370)
-    minBtn.Text = minimized and "+" or "−"
+local mb = Instance.new("TextButton", tb)
+mb.Size = UDim2.new(0, 28, 0, 28); mb.Position = UDim2.new(1, -36, 0.5, -14)
+mb.BackgroundColor3 = C.card; mb.Text = "−"
+mb.TextColor3 = C.txtD; mb.TextSize = 18
+mb.Font = Enum.Font.GothamBold; mb.BorderSizePixel = 0
+Instance.new("UICorner", mb).CornerRadius = UDim.new(0, 7)
+local mini = false
+mb.MouseButton1Click:Connect(function()
+    mini = not mini
+    win.Size = mini and UDim2.new(0, 270, 0, 40) or UDim2.new(0, 270, 0, 520)
+    mb.Text = mini and "+" or "−"
 end)
 
--- ── Status strip ──────────────────────────────────────────────────────────────
-local statusStrip = Instance.new("Frame", win)
-statusStrip.Size = UDim2.new(1, -2, 0, 28)
-statusStrip.Position = UDim2.new(0, 1, 0, 40)
-statusStrip.BackgroundColor3 = C.surface; statusStrip.BorderSizePixel = 0
+-- Status strip
+local ss = Instance.new("Frame", win)
+ss.Size = UDim2.new(1, -2, 0, 28); ss.Position = UDim2.new(0, 1, 0, 40)
+ss.BackgroundColor3 = C.surface; ss.BorderSizePixel = 0
 
-statusLabel = Instance.new("TextLabel", statusStrip)
+statusLabel = Instance.new("TextLabel", ss)
 statusLabel.Size = UDim2.new(0.5, 0, 1, 0); statusLabel.Position = UDim2.new(0, 12, 0, 0)
-statusLabel.BackgroundTransparency = 1; statusLabel.Text = "● 0 NPCs voided"
-statusLabel.TextColor3 = C.txtDim; statusLabel.TextSize = 11
+statusLabel.BackgroundTransparency = 1; statusLabel.Text = "● 0 voided"
+statusLabel.TextColor3 = C.txtD; statusLabel.TextSize = 11
 statusLabel.Font = Enum.Font.Gotham; statusLabel.TextXAlignment = Enum.TextXAlignment.Left
 
-local trackingLabel = Instance.new("TextLabel", statusStrip)
-trackingLabel.Size = UDim2.new(0.5, -12, 1, 0); trackingLabel.Position = UDim2.new(0.5, 0, 0, 0)
-trackingLabel.BackgroundTransparency = 1; trackingLabel.Text = "tracking 0"
-trackingLabel.TextColor3 = C.txtDim; trackingLabel.TextSize = 11
-trackingLabel.Font = Enum.Font.Gotham; trackingLabel.TextXAlignment = Enum.TextXAlignment.Right
+local tl = Instance.new("TextLabel", ss)
+tl.Size = UDim2.new(0.5, -12, 1, 0); tl.Position = UDim2.new(0.5, 0, 0, 0)
+tl.BackgroundTransparency = 1; tl.Text = "tracking 0"
+tl.TextColor3 = C.txtD; tl.TextSize = 11
+tl.Font = Enum.Font.Gotham; tl.TextXAlignment = Enum.TextXAlignment.Right
 
--- Update tracking count every 2 s
 task.spawn(function()
     while true do
-        local count = 0
-        for _ in pairs(liveNPCs) do count = count + 1 end
-        trackingLabel.Text = ("tracking %d"):format(count)
+        local n = 0; for _ in pairs(liveNPCs) do n = n + 1 end
+        tl.Text = ("tracking %d"):format(n)
         task.wait(2)
     end
 end)
 
--- Divider line
-local div1 = Instance.new("Frame", win)
-div1.Size = UDim2.new(1, -24, 0, 1); div1.Position = UDim2.new(0, 12, 0, 68)
-div1.BackgroundColor3 = C.border; div1.BorderSizePixel = 0
+local dv = Instance.new("Frame", win)
+dv.Size = UDim2.new(1, -24, 0, 1); dv.Position = UDim2.new(0, 12, 0, 68)
+dv.BackgroundColor3 = C.border; dv.BorderSizePixel = 0
 
--- ── Scroll / content container ────────────────────────────────────────────────
+-- Content container
 local content = Instance.new("Frame", win)
 content.Size = UDim2.new(1, 0, 1, -70)
 content.Position = UDim2.new(0, 0, 0, 70)
@@ -357,254 +415,186 @@ content.BackgroundTransparency = 1; content.BorderSizePixel = 0
 content.ClipsDescendants = true
 
 local layout = Instance.new("UIListLayout", content)
-layout.Padding = UDim.new(0, 8)
+layout.Padding = UDim.new(0, 7)
 layout.SortOrder = Enum.SortOrder.LayoutOrder
 layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
 
-local contentPad = Instance.new("UIPadding", content)
-contentPad.PaddingTop    = UDim.new(0, 10)
-contentPad.PaddingBottom = UDim.new(0, 10)
-contentPad.PaddingLeft   = UDim.new(0, 12)
-contentPad.PaddingRight  = UDim.new(0, 12)
+local pad = Instance.new("UIPadding", content)
+pad.PaddingTop = UDim.new(0, 10); pad.PaddingBottom = UDim.new(0, 10)
+pad.PaddingLeft = UDim.new(0, 12); pad.PaddingRight = UDim.new(0, 12)
 
--- ── Widget factories ──────────────────────────────────────────────────────────
-local function makeCard(h, order)
-    local card = Instance.new("Frame", content)
-    card.Size = UDim2.new(1, 0, 0, h)
-    card.BackgroundColor3 = C.card; card.BorderSizePixel = 0
-    card.LayoutOrder = order
-    Instance.new("UICorner", card).CornerRadius = UDim.new(0, 8)
-    return card
+-- ── Widget helpers ────────────────────────────────────────────────────────────
+local ti2 = TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+local function card(h, order)
+    local f = Instance.new("Frame", content)
+    f.Size = UDim2.new(1, 0, 0, h)
+    f.BackgroundColor3 = C.card; f.BorderSizePixel = 0
+    f.LayoutOrder = order
+    Instance.new("UICorner", f).CornerRadius = UDim.new(0, 8)
+    return f
 end
 
--- Toggle row: label on left, pill on right
-local function makeToggle(labelTxt, order, default, onChange)
-    local card = makeCard(46, order)
-
-    local lbl = Instance.new("TextLabel", card)
-    lbl.Size = UDim2.new(0.65, 0, 1, 0); lbl.Position = UDim2.new(0, 12, 0, 0)
-    lbl.BackgroundTransparency = 1; lbl.Text = labelTxt
-    lbl.TextColor3 = C.txt; lbl.TextSize = 13; lbl.Font = Enum.Font.Gotham
-    lbl.TextXAlignment = Enum.TextXAlignment.Left
-
-    local pill = Instance.new("Frame", card)
-    pill.Size = UDim2.new(0, 46, 0, 24); pill.Position = UDim2.new(1, -58, 0.5, -12)
-    pill.BorderSizePixel = 0
-    Instance.new("UICorner", pill).CornerRadius = UDim.new(1, 0)
-
-    local knob = Instance.new("Frame", pill)
-    knob.Size = UDim2.new(0, 20, 0, 20); knob.BorderSizePixel = 0
-    knob.BackgroundColor3 = C.knob
-    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
-
-    local state = default
-
-    local tweenInfo = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-
-    local function refresh(animate)
-        local targetColor  = state and C.on  or C.off
-        local targetKnobX  = state and UDim2.new(0, 24, 0.5, -10) or UDim2.new(0, 2, 0.5, -10)
-        if animate then
-            TweenService:Create(pill,  tweenInfo, {BackgroundColor3 = targetColor}):Play()
-            TweenService:Create(knob,  tweenInfo, {Position = targetKnobX}):Play()
-        else
-            pill.BackgroundColor3 = targetColor
-            knob.Position = targetKnobX
-        end
-    end
-    refresh(false)
-
-    -- Click anywhere on the card
-    local clickRegion = Instance.new("TextButton", card)
-    clickRegion.Size = UDim2.new(1, 0, 1, 0); clickRegion.BackgroundTransparency = 1
-    clickRegion.Text = ""; clickRegion.ZIndex = 2
-    clickRegion.MouseButton1Click:Connect(function()
-        state = not state
-        refresh(true)
-        onChange(state)
-    end)
-
-    return card
-end
-
--- Labelled text / number input
-local function makeInput(labelTxt, placeholder, defaultTxt, order, onChange)
-    local card = makeCard(58, order)
-
-    local lbl = Instance.new("TextLabel", card)
-    lbl.Size = UDim2.new(1, -12, 0, 20); lbl.Position = UDim2.new(0, 10, 0, 4)
-    lbl.BackgroundTransparency = 1; lbl.Text = labelTxt
-    lbl.TextColor3 = C.txtDim; lbl.TextSize = 11; lbl.Font = Enum.Font.Gotham
-    lbl.TextXAlignment = Enum.TextXAlignment.Left
-
-    local box = Instance.new("TextBox", card)
-    box.Size = UDim2.new(1, -20, 0, 24); box.Position = UDim2.new(0, 10, 0, 28)
-    box.BackgroundColor3 = C.surface; box.BorderSizePixel = 0
-    box.PlaceholderText = placeholder; box.PlaceholderColor3 = C.txtDim
-    box.Text = defaultTxt; box.TextColor3 = C.txt
-    box.TextSize = 13; box.Font = Enum.Font.GothamBold; box.ClearTextOnFocus = false
-    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
-    local boxPad = Instance.new("UIPadding", box)
-    boxPad.PaddingLeft = UDim.new(0, 6)
-
-    box.FocusLost:Connect(function() onChange(box.Text, box) end)
-    return card, box
-end
-
--- Danger / action button
-local function makeButton(labelTxt, order, onClick)
-    local card = makeCard(38, order)
-    card.BackgroundTransparency = 1
-    Instance.new("UIStroke", card).Color = C.danger
-
-    local btn = Instance.new("TextButton", card)
-    btn.Size = UDim2.new(1, 0, 1, 0); btn.BackgroundTransparency = 1
-    btn.Text = labelTxt; btn.TextColor3 = C.danger
-    btn.TextSize = 13; btn.Font = Enum.Font.GothamBold; btn.BorderSizePixel = 0
-    btn.MouseButton1Click:Connect(onClick)
-    return card
-end
-
--- Section divider label
-local function makeDivider(labelTxt, order)
+local function divider(txt, order)
     local row = Instance.new("Frame", content)
     row.Size = UDim2.new(1, 0, 0, 18)
     row.BackgroundTransparency = 1; row.BorderSizePixel = 0
     row.LayoutOrder = order
-
     local line = Instance.new("Frame", row)
     line.Size = UDim2.new(1, 0, 0, 1); line.Position = UDim2.new(0, 0, 0.5, 0)
     line.BackgroundColor3 = C.border; line.BorderSizePixel = 0
-
     local lbl = Instance.new("TextLabel", row)
-    lbl.Size = UDim2.new(0, 90, 1, 0); lbl.Position = UDim2.new(0.5, -45, 0, 0)
+    lbl.Size = UDim2.new(0, 100, 1, 0); lbl.Position = UDim2.new(0.5, -50, 0, 0)
     lbl.BackgroundColor3 = C.bg; lbl.BorderSizePixel = 0
-    lbl.Text = labelTxt; lbl.TextColor3 = C.txtDim
+    lbl.Text = txt; lbl.TextColor3 = C.txtD
     lbl.TextSize = 10; lbl.Font = Enum.Font.GothamBold
     lbl.TextXAlignment = Enum.TextXAlignment.Center
 end
 
--- ── Build the settings ────────────────────────────────────────────────────────
-
-makeDivider("MAIN", 1)
-
-makeToggle("  Enable", 2, false, function(on)
-    cfg.enabled = on
-    statusLabel.TextColor3 = on and C.on or C.txtDim
-    log("Enabled = " .. tostring(on))
-end)
-
-makeToggle("  Void All  (ignore range)", 3, false, function(on)
-    cfg.killAll = on
-    log("KillAll = " .. tostring(on))
-end)
-
-makeDivider("TARGETING", 4)
-
-local _, rangeBox = makeInput(
-    "📡  Ownership Range  (studs)",
-    "50",
-    tostring(cfg.range),
-    5,
-    function(val, box)
-        local n = tonumber(val)
-        if n and n >= 1 and n <= 2000 then
-            cfg.range = n
-            log("Range = " .. n)
+local function toggle(lbl, order, default, cb)
+    local c = card(44, order)
+    local l = Instance.new("TextLabel", c)
+    l.Size = UDim2.new(0.7, 0, 1, 0); l.Position = UDim2.new(0, 12, 0, 0)
+    l.BackgroundTransparency = 1; l.Text = lbl
+    l.TextColor3 = C.txt; l.TextSize = 12; l.Font = Enum.Font.Gotham
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    local pill = Instance.new("Frame", c)
+    pill.Size = UDim2.new(0, 44, 0, 22); pill.Position = UDim2.new(1, -56, 0.5, -11)
+    pill.BorderSizePixel = 0; Instance.new("UICorner", pill).CornerRadius = UDim.new(1, 0)
+    local knob = Instance.new("Frame", pill)
+    knob.Size = UDim2.new(0, 18, 0, 18); knob.BorderSizePixel = 0
+    knob.BackgroundColor3 = C.knob; Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+    local state = default
+    local function ref(anim)
+        local col = state and C.on or C.off
+        local pos = state and UDim2.new(0,24,0.5,-9) or UDim2.new(0,2,0.5,-9)
+        if anim then
+            TweenService:Create(pill,  ti2, {BackgroundColor3 = col}):Play()
+            TweenService:Create(knob,  ti2, {Position = pos}):Play()
         else
-            box.Text = tostring(cfg.range)
+            pill.BackgroundColor3 = col; knob.Position = pos
         end
     end
-)
+    ref(false)
+    local btn = Instance.new("TextButton", c)
+    btn.Size = UDim2.new(1,0,1,0); btn.BackgroundTransparency = 1
+    btn.Text = ""; btn.ZIndex = 2
+    btn.MouseButton1Click:Connect(function()
+        state = not state; ref(true); cb(state)
+    end)
+end
 
-makeInput(
-    "🎯  NPC Name Filter  (blank = all)",
-    "e.g. Zombie, Boss",
-    "",
-    6,
-    function(val)
-        cfg.nameFilter = val:match("^%s*(.-)%s*$")   -- trim
-        log(('Name filter = "%s"'):format(cfg.nameFilter))
-    end
-)
+local function inputBox(lbl, placeholder, default, order, cb)
+    local c = card(56, order)
+    local l = Instance.new("TextLabel", c)
+    l.Size = UDim2.new(1,-12,0,18); l.Position = UDim2.new(0,10,0,4)
+    l.BackgroundTransparency = 1; l.Text = lbl
+    l.TextColor3 = C.txtD; l.TextSize = 11; l.Font = Enum.Font.Gotham
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    local box = Instance.new("TextBox", c)
+    box.Size = UDim2.new(1,-20,0,24); box.Position = UDim2.new(0,10,0,26)
+    box.BackgroundColor3 = C.surface; box.BorderSizePixel = 0
+    box.PlaceholderText = placeholder; box.PlaceholderColor3 = C.txtD
+    box.Text = default; box.TextColor3 = C.txt
+    box.TextSize = 13; box.Font = Enum.Font.GothamBold; box.ClearTextOnFocus = false
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
+    local p = Instance.new("UIPadding", box); p.PaddingLeft = UDim.new(0,6)
+    box.FocusLost:Connect(function() cb(box.Text, box) end)
+    return box
+end
 
-makeDivider("OPTIONS", 7)
+local function actionBtn(lbl, col, order, cb)
+    local c = card(36, order)
+    c.BackgroundTransparency = 1
+    local s = Instance.new("UIStroke", c); s.Color = col
+    local b = Instance.new("TextButton", c)
+    b.Size = UDim2.new(1,0,1,0); b.BackgroundTransparency = 1
+    b.Text = lbl; b.TextColor3 = col
+    b.TextSize = 12; b.Font = Enum.Font.GothamBold; b.BorderSizePixel = 0
+    b.MouseButton1Click:Connect(cb)
+end
 
-makeToggle("  Debug Log", 8, false, function(on)
+-- ── Build Controls ────────────────────────────────────────────────────────────
+divider("MAIN", 1)
+
+toggle("  Enable", 2, false, function(on)
+    cfg.enabled = on
+    statusLabel.TextColor3 = on and C.on or C.txtD
+end)
+
+toggle("  Void All  (ignore range)", 3, false, function(on)
+    cfg.killAll = on
+end)
+
+divider("TARGETING", 4)
+
+inputBox("📡  Range (studs)", "50", "50", 5, function(v, box)
+    local n = tonumber(v)
+    cfg.range = (n and n >= 1) and n or cfg.range
+    if not n then box.Text = tostring(cfg.range) end
+end)
+
+inputBox("🎯  Name Filter  (blank = all)", "e.g. DIO, Boss", "", 6, function(v)
+    cfg.nameFilter = v:match("^%s*(.-)%s*$")
+end)
+
+divider("METHODS", 7)
+
+toggle("  BodyVelocity  (standard)", 8, true, function(on)
+    cfg.useBodyVel = on
+end)
+
+toggle("  CFrame Spam  (server-locked)", 9, true, function(on)
+    cfg.useSpam = on
+end)
+
+toggle("  AlignPosition  (constraint)", 10, true, function(on)
+    cfg.useAlign = on
+end)
+
+toggle("  Remote Scan  (damage fishing)", 11, true, function(on)
+    cfg.useRemotes = on
+end)
+
+divider("OPTIONS", 12)
+
+toggle("  Debug Log", 13, false, function(on)
     cfg.debugLog = on
 end)
 
-makeDivider("", 9)
+divider("", 14)
 
-makeButton("↺  Reset Voided List", 10, function()
-    processed = {}
+actionBtn("↺  Reset Voided List", C.accent, 15, function()
+    processed = {}; spamTargets = {}
     voidCount = 0
-    statusLabel.Text = "● 0 NPCs voided"
-    statusLabel.TextColor3 = C.txtDim
-    log("Processed list cleared")
+    statusLabel.Text = "● 0 voided"
+    statusLabel.TextColor3 = C.txtD
 end)
 
--- ═══════════════════════════════════════════════════════════════════════════════
--- 8 · Done
--- ═══════════════════════════════════════════════════════════════════════════════
-print("[NPCVoid v2] Loaded.")
+actionBtn("⚡  Force Void Nearest NPC", C.on, 16, function()
+    local myRoot = getMyRoot()
+    if not myRoot then return end
 
---[[
-─────────────────────────────────────────────────────────────────────────────────
-BACKTEST  — manual trace of 9 scenarios
-─────────────────────────────────────────────────────────────────────────────────
+    local nearest, nearestDist = nil, math.huge
+    for npc in pairs(liveNPCs) do
+        local root = getRootPart(npc)
+        if root then
+            local d = (root.Position - myRoot.Position).Magnitude
+            if d < nearestDist then nearest = npc; nearestDist = d end
+        end
+    end
 
-SCENARIO 1 · Solo server, player walks within 50 studs of a 10k-HP NPC
-  isNPC(npc)          → Humanoid exists, Health=10000 > 0, has BasePart     ✅
-  passesFilter(npc)   → nameFilter="" → true                                ✅
-  hasOwnership(root)  → myDist=35 < 50, no other players                   ✅
-  voidNPC             → unanchors, clears BodyMovers, adds BV(-9999Y),
-                         after 80ms teleports to -2500                      ✅
-  Result              → NPC falls into void, server kills it                ✅
+    if nearest then
+        processed[nearest] = nil   -- reset so it can be re-voided
+        if cfg.useBodyVel then methodBodyVel(nearest) end
+        if cfg.useSpam    then methodSpam(nearest)    end
+        if cfg.useAlign   then methodAlign(nearest)   end
+        if cfg.useRemotes then methodRemotes(nearest) end
+        processed[nearest] = true
+        voidCount = voidCount + 1
+        statusLabel.Text = ("● %d voided"):format(voidCount)
+        log("Force void on: " .. nearest.Name)
+    end
+end)
 
-SCENARIO 2 · Two players; other player is 20 studs away, me 40 studs
-  hasOwnership        → myDist=40, theirDist=20 < 40 → returns false        ✅
-  Result              → no void attempt (correct — they own it)             ✅
-
-SCENARIO 3 · NPC is fully anchored (e.g. a stationary boss)
-  voidNPC step 1      → iterates GetDescendants(), sets .Anchored=false      ✅
-  step 3              → BodyVelocity now takes effect                        ✅
-  step 4              → fallback CFrame also works on unanchored part        ✅
-  Result              → voided                                               ✅
-
-SCENARIO 4 · NPC has no HumanoidRootPart
-  getRootPart         → HumanoidRootPart = nil
-                      → PrimaryPart checked (nil if not set)
-                      → FindFirstChildWhichIsA("BasePart", true)
-                         returns first found BasePart                        ✅
-  voidNPC proceeds on that part; BodyVelocity moves whole model via
-  Roblox's weld/motor6D chain                                                ✅
-
-SCENARIO 5 · NPC.Health drops to 0 before we void it
-  Humanoid.Health signal fires → liveNPCs[model] = nil                      ✅
-  Heartbeat skips it (not in liveNPCs)                                      ✅
-  Result              → no void attempt on dead NPC                         ✅
-
-SCENARIO 6 · Player character not yet loaded (e.g. loading screen)
-  getMyRoot()         → player.Character = nil → returns nil                ✅
-  hasOwnership        → myRoot nil → returns false                          ✅
-  Result              → no crash, no void attempt                           ✅
-
-SCENARIO 7 · NPC instance removed between Heartbeat ticks (mid-void)
-  task.delay(0.08) callback fires → checks root.Parent.Parent ~= nil        ✅
-  root.Parent (Model) was removed → condition false → teleport skipped      ✅
-  DescendantRemoving already cleared processed[npc]                         ✅
-
-SCENARIO 8 · Name filter "zombie", NPC named "ZombieKing"
-  passesFilter: "zombieking":find("zombie",1,true) → index 1 (truthy)       ✅
-  Result              → matches and gets voided                              ✅
-
-SCENARIO 9 · NPC respawns as a NEW instance after being voided
-  DescendantRemoving clears processed[oldInstance] and liveNPCs[oldInstance]✅
-  DescendantAdded fires for newInstance → liveNPCs[newInstance]=true        ✅
-  processed[newInstance] is nil (different Lua reference)                    ✅
-  Result              → new instance correctly gets voided                  ✅
-
-All 9 scenarios pass.  No crashes, no skipped voids, no false positives.
-─────────────────────────────────────────────────────────────────────────────────
---]]
+print("[NPCVoid v3 - Boss Edition] Loaded.")
